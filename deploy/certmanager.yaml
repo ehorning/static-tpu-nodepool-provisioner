@@ -1,0 +1,21 @@
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: tpu-provisioner-selfsigned-issuer
+  namespace: tpu-provisioner-system
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: tpu-provisioner-webhook-cert
+  namespace: tpu-provisioner-system
+spec:
+  dnsNames:
+  - tpu-provisioner-webhook-service.tpu-provisioner-system.svc
+  - tpu-provisioner-webhook-service.tpu-provisioner-system.svc.cluster.local
+  issuerRef:
+    kind: Issuer
+    name: tpu-provisioner-selfsigned-issuer
+  secretName: webhook-server-cert

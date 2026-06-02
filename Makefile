@@ -54,7 +54,7 @@ test-unit: manifests fmt vet ## Run unit tests.
 
 .PHONY: test-integration
 test-integration: manifests fmt vet envtest ## Run integration tests.
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test ./test/integration/... -v -coverprofile cover-integration.out
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test -p 1 ./test/integration/... -v -coverprofile cover-integration.out
 
 .PHONY: test
 test: test-unit test-integration ## Run all tests.
