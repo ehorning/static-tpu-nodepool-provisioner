@@ -62,7 +62,7 @@ func (g *GKENodePoolService) Create(ctx context.Context, req *containerv1beta1.C
 }
 
 func (g *GKENodePoolService) Delete(ctx context.Context, name string, callbacks OpCallbacks) error {
-	op, err := g.Service.Projects.Locations.Clusters.Delete(g.ClusterContext.NodePoolName(name)).Context(ctx).Do()
+	op, err := g.Service.Projects.Locations.Clusters.NodePools.Delete(g.ClusterContext.NodePoolName(name)).Context(ctx).Do()
 	if err != nil {
 		if gerr, ok := err.(*googleapi.Error); ok && gerr.Code == http.StatusNotFound {
 			if callbacks.NotFound != nil {
