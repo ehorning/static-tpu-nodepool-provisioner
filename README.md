@@ -17,7 +17,9 @@ This provisioner is specifically optimized for workloads utilizing **gSC (Google
 
 ## Configuration
 
-The **Static Nodepool Provisioner** is entirely configured via a single Kubernetes `ConfigMap` named `tpu-provisioner-static-nodepools-config` in the same namespace as the controller.
+The **Static Nodepool Provisioner** is entirely configured via a single Kubernetes `ConfigMap` named `tpu-provisioner-static-nodepools-config` in the same namespace as the controller (by default: `tpu-provisioner-system`).
+
+The controller is created in the namespace `tpu-provisioner-system` by default and so both the controller and the validating webhook watches for config maps created in this namespace.
 
 ### Configuration Specification Example
 
@@ -74,6 +76,8 @@ A list of GSC reservations each containing a list of subblocks:
   - **`subblocks`**: Subblock index range to target (e.g., `"0001-0004"` or a single index `"0002"`).
   - **`nodepoolConfig`** *(Optional)*: Override defaults or define custom GKE NodePool configurations on a per-subblock-range basis. Fields specified here override or augment the root-level fallback `defaultNodepoolConfig` field-by-field.
 
+Specifying an empty reservations list will result in all node pools managed by the controller being deleted.
+
 #### `defaultNodepoolConfig` (and `nodepoolConfig` under subblocks)
 Configuration attributes applied as defaults/fallbacks (or on a per-subblock level):
 - **`nodepoolPrefix`** *(Optional)*: Prefix for created node pool names. If omitted, falls back to the default config prefix, then to using the block name.
@@ -89,6 +93,111 @@ Configuration attributes applied as defaults/fallbacks (or on a per-subblock lev
 
 ---
 
+### How to guides
+
+#### Create a TPU node pool targeting single subblock
+
+```bash
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tpu-provisioner-static-nodepools-config
+  namespace: tpu-provisioner-system
+data:
+  reservations: |
+    - name: "my-gsc-reservation"
+      gscSubblocks:
+        - block: "block-1"
+          subblocks: "0001"
+          nodepoolConfig:
+            nodepoolPrefix: "example-1"
+            machineType: "tpu7x-standard-4t"
+            topology: "4x4x4"
+            nodeCount: 16
+  # Default/fallback config map applied to all nodepools unless overridden at the subblock level
+  defaultNodepoolConfig: |
+    nodepoolPrefix: "example"
+    machineType: "tpu7x-standard-4t"
+    accelerator: "tpu7x"
+    topology: "4x4x4"
+    nodeCount: 16
+    nodeLabels:
+      my-custom-key: "my-custom-value"
+    shieldedIntegrityMonitoring: true
+    shieldedSecureBoot: true
+    maxPodsPerNode: 15
+    enableAutorepair: true
+```
+
+#### Create TPU node pools targeting a list of subblocks
+
+A separate node pool is created for each subblock.
+The following command will result in the creation of the node pools: "example-1-0001", "example-1-0002", "example-1-0003", "example-1-0004"
+
+```bash
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tpu-provisioner-static-nodepools-config
+  namespace: tpu-provisioner-system
+data:
+  reservations: |
+    - name: "my-gsc-reservation"
+      gscSubblocks:
+        - block: "block-1"
+          subblocks: "0001-0004"
+          nodepoolConfig:
+            nodepoolPrefix: "example-1"
+            machineType: "tpu7x-standard-4t"
+            topology: "4x4x4"
+            nodeCount: 16
+  # Default/fallback config map applied to all nodepools unless overridden at the subblock level
+  defaultNodepoolConfig: |
+    nodepoolPrefix: "example"
+    machineType: "tpu7x-standard-4t"
+    accelerator: "tpu7x"
+    topology: "4x4x4"
+    nodeCount: 16
+    nodeLabels:
+      my-custom-key: "my-custom-value"
+    shieldedIntegrityMonitoring: true
+    shieldedSecureBoot: true
+    maxPodsPerNode: 15
+    enableAutorepair: true
+```
+
+#### Delete all node pools managed by the controller
+
+To delete all node pools managed by the controller, empty the reservations field in the configmap.
+NOTE: You must provide a defaultNodepoolConfig for the controller to consider the configmap to be valid if reservations is empty.
+
+```bash
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tpu-provisioner-static-nodepools-config
+  namespace: tpu-provisioner-system
+data:
+  reservations: "[]"
+  defaultNodepoolConfig: |
+    nodepoolPrefix: "example"
+    machineType: "tpu7x-standard-4t"
+    accelerator: "tpu7x"
+    topology: "4x4x4"
+    nodeCount: 16
+    nodeLabels:
+      my-custom-key: "my-custom-value"
+    shieldedIntegrityMonitoring: true
+    shieldedSecureBoot: true
+    maxPodsPerNode: 15
+    enableAutorepair: true
+```
+
+---
+
 ## Life Cycle Reconcile Safeguards
 
 ### In-Use Safety Lock
@@ -100,6 +209,68 @@ Before any node pool deletion or modification is executed:
 
 ### Self-Healing Error Mitigation
 If a node pool build fails and falls into GKE `ERROR` status (e.g., because of cloud quota limits or transient system outages), the manager automatically identifies the problem, deletes the failing capacity, and schedules an organic rebuild.
+
+---
+
+## Deployment
+
+The static TPU nodepool provisioner is designed to be deployed into the `tpu-provisioner-system` namespace. You can deploy it using the provided manifests in the `deploy/` directory.
+
+### Prerequisites
+
+1. Ensure you have a cluster running with Workload Identity enabled, as the controller needs permission to manage NodePools via the GCP API. You also need an Artifact Registry or Docker Hub repository to host the built image.
+2. Ensure that the cluster has Slice Controller enabled on it as we watch for Slices to determine if we can delete a node as a safety check. Follow https://docs.cloud.google.com/kubernetes-engine/docs/how-to/use-gke-dynamic-slicing#enable_the_slice_controller for instructions on how to enable Slice controller and ensure you have the `slices.accelerator.gke.io` CRD present in the cluster.
+3. Since this controller uses a Validating Webhook to reject invalid ConfigMaps, you must install [cert-manager](https://cert-manager.io/docs/installation/) in your cluster to automatically provision TLS certificates for the webhook server.
+
+NOTE: Your cluster must have access to the internet to pull the images for cert-manager or you must edit the configuration to use private images from repositories that your cluster can access.
+
+### 1. Build and Push the Image
+
+Build and push the provisioner image using the provided Makefile targets:
+
+```bash
+# Build the image
+make docker-build IMG=gcr.io/your-project/static-np-provisioner:latest
+
+# Push the image
+make docker-push IMG=gcr.io/your-project/static-np-provisioner:latest
+```
+
+### 2. Configure Manifests
+
+Before applying the manifests, you must configure your environment-specific values in `deploy/deployment.yaml`:
+1. Replace `<image>` with your pushed image tag (e.g. `gcr.io/your-project/static-np-provisioner:latest`).
+2. Replace `<gsa>` with the Google Service Account email that has permissions to manage GKE NodePools.
+3. Update the `GCP_ZONE` environment variable if your cluster is in a different zone.
+4. If you've updated the namespace that the controller is being deployed to, update the namespace that the webhook is watching by updating `webhook[0].namespaceSelector.matchLabels.kubernetes.io/metadata.name` field in `deploy/webhook.yaml`.
+
+### 3. Configure Workload Identity
+
+The provisioner uses GKE Workload Identity to authenticate with GCP APIs. You must bind the Kubernetes Service Account (KSA) to your Google Service Account (GSA) so the provisioner is granted access.
+
+If the cluster hasn't already enabled Workload Identity, follow the instructions here: https://cloud.google.com/kubernetes-engine/docs/how-to/workload-identity
+
+Run the following command to create the IAM policy binding (replace `<gsa>` and `<project-id>`):
+
+```bash
+gcloud iam service-accounts add-iam-policy-binding <gsa> \
+    --role roles/iam.workloadIdentityUser \
+    --member "serviceAccount:<project-id>.svc.id.goog[tpu-provisioner-system/tpu-provisioner-controller-manager]"
+```
+
+*Note: The GSA must have the `roles/container.clusterAdmin` role (or equivalent permissions to create and delete GKE NodePools).*
+
+### 4. Apply Manifests
+
+Once the manifests are updated, apply the RBAC permissions, deployment, webhook, and an initial ConfigMap:
+
+```bash
+kubectl apply -f config/rbac/role.yaml
+kubectl apply -f deploy/deployment.yaml
+kubectl apply -f deploy/certmanager.yaml
+kubectl apply -f deploy/webhook.yaml
+kubectl apply -f deploy/configmap.yaml
+```
 
 ---
 
