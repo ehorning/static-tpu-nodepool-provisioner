@@ -1,13 +1,22 @@
 package controller
 
 import (
+	"context"
+	"strings"
 	"testing"
 
 	"github.com/GoogleCloudPlatform/ai-on-gke/static-np-provisioner/copied/api/v1beta1"
 	"github.com/GoogleCloudPlatform/ai-on-gke/static-np-provisioner/internal/cloud"
 	"github.com/GoogleCloudPlatform/ai-on-gke/static-np-provisioner/internal/config"
+	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestGetInUseNodepools(t *testing.T) {
@@ -280,4 +289,136 @@ func TestConstructDesiredNodePools(t *testing.T) {
 			t.Fatal("expected error, got nil")
 		}
 	})
+}
+
+// TODO(joat): Unify Mock and ConfigurableMock providers and replace this struct with Mock.
+type configurableProvider struct {
+	cloud.Provider
+	existingNodepools        []cloud.NodePoolRef
+	missingNodepools         []string
+	deletedNodepools         []string
+	recordedDesiredNodepools []*cloud.DesiredStaticNodePool
+}
+
+func (p *configurableProvider) ListNodePools() ([]cloud.NodePoolRef, error) {
+	return p.existingNodepools, nil
+}
+
+func (p *configurableProvider) DiffStaticNodePools(existingNodepools []cloud.NodePoolRef, desiredNodepools []*cloud.DesiredStaticNodePool) ([]*cloud.DesiredStaticNodePool, []string, []string, []string, error) {
+	p.recordedDesiredNodepools = desiredNodepools
+	return nil, p.missingNodepools, nil, nil, nil
+}
+
+func (p *configurableProvider) DeleteStaticNodePools(ctx context.Context, nodepoolNames []string, concurrency int, eventObj client.Object, why string) []error {
+	p.deletedNodepools = append(p.deletedNodepools, nodepoolNames...)
+	return nil
+}
+
+func TestReconcile_StaticNodePoolController(t *testing.T) {
+	tests := []struct {
+		name                  string
+		cmData                map[string]string
+		mockExistingNodepools []cloud.NodePoolRef
+		mockMissingPools      []string
+		wantDesiredCount      int
+		wantDeleted           []string
+		wantEvent             string
+		wantErr               bool
+	}{
+		{
+			name: "EmptyReservationsDeletesAll",
+			cmData: map[string]string{
+				"reservations":          "[]",
+				"defaultNodepoolConfig": `machineType: "tpu-v4"`,
+			},
+			mockExistingNodepools: []cloud.NodePoolRef{
+				{Name: "existing-pool-1"},
+				{Name: "existing-pool-2"},
+			},
+			mockMissingPools: []string{"existing-pool-1", "existing-pool-2"},
+			wantDesiredCount: 0,
+			wantDeleted:      []string{"existing-pool-1", "existing-pool-2"},
+			wantErr:          false,
+		},
+		{
+			name: "InvalidConfigurationRecordsEvent",
+			cmData: map[string]string{
+				"defaultNodepoolConfig": `machineType: "tpu-v4"`,
+			},
+			wantEvent: "Warning InvalidConfiguration",
+			wantErr:   false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      ConfigMapName,
+					Namespace: "default",
+				},
+				Data: tc.cmData,
+			}
+
+			fakeScheme := runtime.NewScheme()
+			_ = v1beta1.AddToScheme(fakeScheme)
+			_ = corev1.AddToScheme(fakeScheme)
+
+			fakeClient := fake.NewClientBuilder().WithScheme(fakeScheme).WithObjects(cm).Build()
+			fakeRecorder := record.NewFakeRecorder(10)
+
+			provider := &configurableProvider{
+				existingNodepools: tc.mockExistingNodepools,
+				missingNodepools:  tc.mockMissingPools,
+			}
+
+			r := &StaticNodepoolReconciler{
+				Client:   fakeClient,
+				Recorder: fakeRecorder,
+				Provider: provider,
+			}
+
+			req := ctrl.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      ConfigMapName,
+					Namespace: "default",
+				},
+			}
+
+			_, err := r.Reconcile(ctx, req)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Reconcile() error = %v, wantErr %v", err, tc.wantErr)
+			}
+
+			if diff := cmp.Diff(tc.wantDeleted, provider.deletedNodepools); diff != "" {
+				t.Errorf("deletedNodepools mismatch (-want +got):\n%s", diff)
+			}
+
+			if got := len(provider.recordedDesiredNodepools); got != tc.wantDesiredCount {
+				t.Errorf("len(provider.recordedDesiredNodepools) = %d, want %d", got, tc.wantDesiredCount)
+			}
+
+			if tc.wantEvent != "" {
+				select {
+				case event := <-fakeRecorder.Events:
+					if event == "" {
+						t.Fatal("got empty event string, want non-empty")
+					}
+					if !strings.HasPrefix(event, tc.wantEvent) {
+						t.Errorf("event = %q, want prefix %q", event, tc.wantEvent)
+					}
+				default:
+					t.Fatalf("got 0 events, want event with prefix %q", tc.wantEvent)
+				}
+			} else {
+				select {
+				case event := <-fakeRecorder.Events:
+					t.Fatalf("got unexpected event %q, want none", event)
+				default:
+				}
+			}
+		})
+	}
 }

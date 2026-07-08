@@ -8,6 +8,7 @@ import (
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/GoogleCloudPlatform/ai-on-gke/static-np-provisioner/copied/api/v1beta1"
 	"github.com/GoogleCloudPlatform/ai-on-gke/static-np-provisioner/internal/cloud"
@@ -33,7 +34,10 @@ var _ = Describe("Static Nodepool controller", func() {
       nodepoolPrefix: "test-nodepool"
 `,
 					"defaultNodepoolConfig": `
-machineType: "tpu7x"
+machineType: "tpu7x-standard-4t"
+topology: "4x4x4"
+placementPolicy: "tpu-provisioner-4x4x4"
+nodeCount: 16
 `,
 				},
 			}
@@ -57,6 +61,69 @@ machineType: "tpu7x"
 		})
 	})
 
+	Context("when an invalid static nodepool configmap is created", func() {
+		It("should fail validation and not create any nodepools", func() {
+			ctx := context.Background()
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "invalid-configmap-test",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{
+					"reservations": `
+- name: "reservation-invalid"
+  gscSubblocks:
+  - block: "gsc-block-1"
+    subblocks: "0001-0002"
+    nodepoolConfig:
+      nodepoolPrefix: "invalid-pool"
+`,
+					"defaultNodepoolConfig": `
+machineType: "tpu7x-standard-8t"
+topology: "4x4x4"
+placementPolicy: "tpu-provisioner-4x4x4"
+nodeCount: 16
+`,
+				},
+			}
+
+			By("Creating an invalid configmap (bypassing webhook)")
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			By("Checking that no nodepools are created due to validation error")
+			Consistently(func() bool {
+				nodePools, err := provider.ListNodePools()
+				if err != nil {
+					return false
+				}
+				for _, np := range nodePools {
+					if np.Name == "invalid-pool-0001" || np.Name == "invalid-pool-0002" {
+						return true
+					}
+				}
+				return false
+			}, timeout, interval).Should(BeFalse())
+
+			By("Checking that an InvalidConfiguration event is recorded")
+			Eventually(func() bool {
+				events := &corev1.EventList{}
+				err := k8sClient.List(ctx, events, client.InNamespace(cm.Namespace))
+				if err != nil {
+					return false
+				}
+				for _, event := range events.Items {
+					if event.Reason == "InvalidConfiguration" && event.InvolvedObject.Name == cm.Name {
+						return true
+					}
+				}
+				return false
+			}, timeout, interval).Should(BeTrue())
+
+			// Cleanup
+			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
+		})
+	})
+
 	Context("when a valid static nodepool configmap is updated", func() {
 		It("should update the nodepools", func() {
 			ctx := context.Background()
@@ -75,7 +142,10 @@ machineType: "tpu7x"
       nodepoolPrefix: "update-test-nodepool"
 `,
 					"defaultNodepoolConfig": `
-machineType: "tpu7x"
+machineType: "tpu7x-standard-4t"
+topology: "4x4x4"
+placementPolicy: "tpu-provisioner-4x4x4"
+nodeCount: 16
 `,
 				},
 			}
@@ -158,7 +228,10 @@ machineType: "tpu7x"
       nodepoolPrefix: "recreate-test-nodepool"
 `,
 					"defaultNodepoolConfig": `
-machineType: "tpu-v4"
+machineType: "tpu7x-standard-4t"
+topology: "4x4x4"
+placementPolicy: "tpu-provisioner-4x4x4"
+nodeCount: 16
 `,
 				},
 			}
@@ -182,9 +255,12 @@ machineType: "tpu-v4"
 
 			// Update the configmap
 			cm.Data["defaultNodepoolConfig"] = `
-machineType: "tpu-v5"
+machineType: "tpu7x-standard-4t"
+topology: "2x2x2"
+placementPolicy: "tpu-provisioner-2x2x2"
+nodeCount: 2
 `
-			By("Updating the configmap with a new machine type")
+			By("Updating the configmap with a new topology")
 			Expect(k8sClient.Update(ctx, cm)).To(Succeed())
 
 			By("Checking that the nodepool was recreated")
@@ -209,6 +285,62 @@ machineType: "tpu-v5"
 		})
 	})
 
+	Context("when a static nodepool configmap is updated with empty reservations", func() {
+		It("should delete all nodepools", func() {
+			ctx := context.Background()
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "static-nodepool-config-to-empty",
+					Namespace: testNamespace,
+				},
+				Data: map[string]string{
+					"reservations": `
+- name: "reservation-to-empty"
+  gscSubblocks:
+  - block: "gsc-block-to-empty"
+    subblocks: "0001"
+    nodepoolConfig:
+      nodepoolPrefix: "empty-test-nodepool"
+`,
+					"defaultNodepoolConfig": `
+machineType: "tpu7x-standard-4t"
+topology: "4x4x4"
+placementPolicy: "tpu-provisioner-4x4x4"
+nodeCount: 16
+`,
+				},
+			}
+
+			By("Creating a configmap with a static nodepool")
+			Expect(k8sClient.Create(ctx, cm)).To(Succeed())
+
+			By("Checking that the initial nodepool was created")
+			Eventually(func() bool {
+				nodePools, err := provider.ListNodePools()
+				if err != nil {
+					return false
+				}
+				for _, np := range nodePools {
+					if np.Name == "empty-test-nodepool-0001" {
+						return true
+					}
+				}
+				return false
+			}, timeout, interval).Should(BeTrue())
+
+			// Update the configmap
+			cm.Data["reservations"] = "[]"
+			By("Updating the configmap with empty reservations")
+			Expect(k8sClient.Update(ctx, cm)).To(Succeed())
+
+			By("Checking that the nodepool was deleted")
+			Eventually(func() bool {
+				_, deleted := provider.getDeleted("empty-test-nodepool-0001")
+				return deleted
+			}, timeout, interval).Should(BeTrue())
+		})
+	})
+
 	Context("when a static nodepool is in use by a Slice", func() {
 		It("should not delete the nodepool even if removed from config", func() {
 			ctx := context.Background()
@@ -227,7 +359,10 @@ machineType: "tpu-v5"
       nodepoolPrefix: "slice-test-np"
 `,
 					"defaultNodepoolConfig": `
-machineType: "tpu-v4"
+machineType: "tpu7x-standard-4t"
+topology: "4x4x4"
+placementPolicy: "tpu-provisioner-4x4x4"
+nodeCount: 16
 `,
 				},
 			}
@@ -329,7 +464,10 @@ machineType: "tpu-v4"
       nodepoolPrefix: "old-pool"
 `,
 					"defaultNodepoolConfig": `
-machineType: "tpu-v4"
+machineType: "tpu7x-standard-4t"
+topology: "4x4x4"
+placementPolicy: "tpu-provisioner-4x4x4"
+nodeCount: 16
 `,
 				},
 			}
@@ -459,6 +597,7 @@ machineType: "tpu-v4"
       nodepoolPrefix: "large-np"
       machineType: "tpu7x-standard-4t"
       topology: "4x4x4"
+      placementPolicy: "tpu-provisioner-4x4x4"
       nodeCount: 16
   - block: "gsc-block-small"
     subblocks: "0001"
@@ -466,7 +605,8 @@ machineType: "tpu-v4"
       nodepoolPrefix: "small-np"
       machineType: "tpu7x-standard-4t"
       topology: "2x2x2"
-      nodeCount: 4
+      placementPolicy: "tpu-provisioner-2x2x2"
+      nodeCount: 2
 `,
 				},
 			}
@@ -499,7 +639,7 @@ machineType: "tpu-v4"
 					}
 					if np.Name == "small-np-0001" {
 						cfg, exists := provider.getConfig("small-np-0001")
-						if exists && cfg.MachineType == "tpu7x-standard-4t" && cfg.Topology == "2x2x2" && cfg.NodeCount == 4 {
+						if exists && cfg.MachineType == "tpu7x-standard-4t" && cfg.Topology == "2x2x2" && cfg.NodeCount == 2 {
 							foundSmall = true
 						}
 					}

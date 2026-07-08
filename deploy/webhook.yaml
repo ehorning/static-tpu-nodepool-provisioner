@@ -1,0 +1,44 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: tpu-provisioner-validating-webhook
+  annotations:
+    cert-manager.io/inject-ca-from: tpu-provisioner-system/tpu-provisioner-webhook-cert
+webhooks:
+  - name: configmap.tpu-provisioner.google.com
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["configmaps"]
+        scope: "Namespaced"
+    clientConfig:
+      service:
+        name: tpu-provisioner-webhook-service
+        namespace: tpu-provisioner-system
+        path: "/validate-configmap"
+        port: 443
+    # To secure the admission request, cert-manager or GKE automatic injection injects the CA bundle here.
+    # caBundle: "..."
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    timeoutSeconds: 10
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: tpu-provisioner-system
+    matchConditions:
+      - name: "is-tpu-provisioner-config"
+        expression: "request.name == 'tpu-provisioner-static-nodepools-config'"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tpu-provisioner-webhook-service
+  namespace: tpu-provisioner-system
+spec:
+  ports:
+    - port: 443
+      targetPort: 9443
+      protocol: TCP
+  selector:
+        control-plane: controller-manager

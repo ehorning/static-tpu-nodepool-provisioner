@@ -32,6 +32,7 @@ import (
 	"github.com/GoogleCloudPlatform/ai-on-gke/static-np-provisioner/copied/api/v1beta1"
 	"github.com/GoogleCloudPlatform/ai-on-gke/static-np-provisioner/internal/cloud"
 	"github.com/GoogleCloudPlatform/ai-on-gke/static-np-provisioner/internal/controller"
+	"github.com/GoogleCloudPlatform/ai-on-gke/static-np-provisioner/internal/webhook"
 
 	containerv1beta1 "google.golang.org/api/container/v1beta1"
 	corev1 "k8s.io/api/core/v1"
@@ -46,6 +47,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
 
 var (
@@ -215,6 +217,14 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "StaticNodepoolReconciler")
 		os.Exit(1)
 	}
+
+	// Register the ConfigMap validating admission webhook.
+	decoder := admission.NewDecoder(mgr.GetScheme())
+	v := &webhook.ConfigMapValidator{Client: mgr.GetClient()}
+	v.InjectDecoder(decoder)
+	mgr.GetWebhookServer().Register("/validate-configmap", &admission.Webhook{
+		Handler: v,
+	})
 
 	// Setup manager health checks.
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

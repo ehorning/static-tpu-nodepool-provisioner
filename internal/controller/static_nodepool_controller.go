@@ -74,9 +74,16 @@ func (r *StaticNodepoolReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, fmt.Errorf("failed to get configmap %s: %w", req.NamespacedName.String(), err)
 	}
 
+	if err := config.ValidateConfigMap(&cm); err != nil {
+		lg.Error(err, "invalid static nodepool configmap", "configmap", req.NamespacedName.String())
+		r.Recorder.Event(&cm, corev1.EventTypeWarning, "InvalidConfiguration", err.Error())
+		return ctrl.Result{}, nil
+	}
+
 	reservations, defaultConfig, err := config.ParseConfigMap(&cm)
 	if err != nil {
 		lg.Error(err, "failed to parse configmap", "configmap", req.NamespacedName.String())
+		r.Recorder.Event(&cm, corev1.EventTypeWarning, "InvalidConfiguration", err.Error())
 		return ctrl.Result{}, nil
 	}
 
